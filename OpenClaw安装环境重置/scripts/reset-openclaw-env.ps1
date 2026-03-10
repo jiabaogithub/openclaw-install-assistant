@@ -1,26 +1,59 @@
 ﻿# OpenClaw安装环境重置程序
-# 支持的操作系统：Windows11
 # 作者：再凝秋水
 Write-Host "============================"
 Write-Host "OpenClaw安装环境重置程序"
 Write-Host ""
-Write-Host "支持的操作系统：Windows11"
+Write-Host "支持的操作系统：Windows11 / Windows10"
 Write-Host ""
 Write-Host "作者：再凝秋水"
 Write-Host ""
 Write-Host "版本：v1.0.0-20260310"
 Write-Host "============================"
 Write-Host ""
-Write-Host "开始重置..."
 
 # 检查管理员权限
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 $admin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
 if (-not $admin) {
-    Write-Host "请用管理员 PowerShell 运行"
+    Write-Host "请以管理员身份运行本脚本"
     exit
 }
+
+# ============================================================
+# 操作确认
+# ============================================================
+
+Write-Host "本脚本将对您的系统进行以下清理操作：" -ForegroundColor Cyan
+Write-Host "·卸载 Node.js、Git环境 " -ForegroundColor Cyan
+Write-Host "·删除以下目录（如存在）：" -ForegroundColor Cyan
+Write-Host " C:\Program Files\nodejs" -ForegroundColor Cyan
+Write-Host " C:\Program Files\Git" -ForegroundColor Cyan
+Write-Host " %APPDATA%\npm 、%APPDATA%\npm-cache" -ForegroundColor Cyan
+Write-Host " %APPDATA%\nvm 、%APPDATA%\fnm" -ForegroundColor Cyan
+Write-Host " %LOCALAPPDATA%\npm-cache 、%LOCALAPPDATA%\pnpm" -ForegroundColor Cyan
+Write-Host " %LOCALAPPDATA%\Yarn 、%LOCALAPPDATA%\node-gyp" -ForegroundColor Cyan
+Write-Host " %USERPROFILE%\.pnpm-store 、%USERPROFILE%\.yarn" -ForegroundColor Cyan
+Write-Host " %USERPROFILE%\.ssh 、%USERPROFILE%\.gitconfig" -ForegroundColor Cyan
+Write-Host " %USERPROFILE%\.git-credentials" -ForegroundColor Cyan
+Write-Host " %USERPROFILE%\.openclaw" -ForegroundColor Cyan
+Write-Host " %LOCALAPPDATA%\Temp\openclaw" -ForegroundColor Cyan
+Write-Host "·清理系统及用户 PATH 中与 Node / Git / npm 相关的条目" -ForegroundColor Cyan
+Write-Host "·卸载 OpenClaw 网关服务及相关计划任务" -ForegroundColor Cyan
+Write-Host ""
+Write-Host " 如果您在上述目录中存有其他重要资料，建议先手动备份后再继续。" -ForegroundColor DarkCyan
+Write-Host "-------------------------------------------------------------"
+Write-Host ""
+
+$confirm = Read-Host "确认继续？请输入 yes 继续，输入其他任意内容取消,输入后请敲回车"
+if ($confirm -ne "yes") {
+    Write-Host ""
+    Write-Host "已取消，未对系统做任何修改。" -ForegroundColor Gray
+    exit
+}
+
+Write-Host ""
+Write-Host "开始重置..."
 
 # ============================================================
 # 公共函数
@@ -208,96 +241,124 @@ if (-not $nodeProc) {
 
 # ============================================================
 # Step 5：卸载 Node.js
-# 顺序：包管理器正式卸载 → 注册表定位 → where.exe 定位 → 硬编码兜底
+# 顺序：包管理器正式卸载 → WMI 兜底 → 注册表定位 → where.exe 定位 → 硬编码兜底
 # ============================================================
 
 Write-Host ""
 Write-Host "5. 卸载 Node.js"
 
-# 5-1 包管理器正式卸载
-if (Get-Command winget -ErrorAction SilentlyContinue) {
-    $wingetList = winget list 2>$null
-    if ($wingetList -match "OpenJS\.NodeJS") {
-        Write-Host "  [winget] 检测到 Node.js，执行卸载..."
-        winget uninstall --id OpenJS.NodeJS --silent --accept-source-agreements 2>$null
-        winget uninstall --id OpenJS.NodeJS.LTS --silent --accept-source-agreements 2>$null
-        Write-Host "  [winget] 卸载完成" -ForegroundColor Green
-    } else {
-        Write-Host "  [winget] 未检测到 Node.js，跳过" -ForegroundColor Gray
+# 先判断 node 是否存在，不存在则跳过整个 Step 5
+$nodeExists = Get-Command node -ErrorAction SilentlyContinue
+if (-not $nodeExists) {
+    Write-Host "  未检测到 Node.js，跳过卸载" -ForegroundColor Gray
+} else {
+
+    # 5-1 包管理器正式卸载，记录是否卸载成功
+    $uninstalledByPkgManager = $false
+
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        $wingetList = winget list 2>$null
+        if ($wingetList -match "OpenJS\.NodeJS") {
+            Write-Host "  [winget] 检测到 Node.js，执行卸载..."
+            winget uninstall --id OpenJS.NodeJS --silent --accept-source-agreements 2>$null
+            winget uninstall --id OpenJS.NodeJS.LTS --silent --accept-source-agreements 2>$null
+            Write-Host "  [winget] 卸载完成" -ForegroundColor Green
+            $uninstalledByPkgManager = $true
+        } else {
+            Write-Host "  [winget] 未检测到 Node.js，跳过" -ForegroundColor Gray
+        }
     }
-}
 
-if (Get-Command choco -ErrorAction SilentlyContinue) {
-    $chocoList = choco list 2>$null
-    # nodejs 和 nodejs-lts 是两个不同的包名，分别检测分别卸载
-    if ($chocoList | Select-String "^nodejs-lts") {
-        Write-Host "  [choco] 检测到 nodejs-lts，执行卸载..."
-        choco uninstall nodejs-lts -y
-        Write-Host "  [choco] nodejs-lts 卸载完成" -ForegroundColor Green
-    } else {
-        Write-Host "  [choco] 未检测到 nodejs-lts，跳过" -ForegroundColor Gray
+    if (Get-Command choco -ErrorAction SilentlyContinue) {
+        $chocoList = choco list 2>$null
+        if ($chocoList | Select-String "^nodejs-lts") {
+            Write-Host "  [choco] 检测到 nodejs-lts，执行卸载..."
+            choco uninstall nodejs-lts -y
+            Write-Host "  [choco] nodejs-lts 卸载完成" -ForegroundColor Green
+            $uninstalledByPkgManager = $true
+        } else {
+            Write-Host "  [choco] 未检测到 nodejs-lts，跳过" -ForegroundColor Gray
+        }
+        if ($chocoList | Select-String "^nodejs ") {
+            Write-Host "  [choco] 检测到 nodejs，执行卸载..."
+            choco uninstall nodejs -y
+            Write-Host "  [choco] nodejs 卸载完成" -ForegroundColor Green
+            $uninstalledByPkgManager = $true
+        } else {
+            Write-Host "  [choco] 未检测到 nodejs，跳过" -ForegroundColor Gray
+        }
     }
-    if ($chocoList | Select-String "^nodejs ") {
-        Write-Host "  [choco] 检测到 nodejs，执行卸载..."
-        choco uninstall nodejs -y
-        Write-Host "  [choco] nodejs 卸载完成" -ForegroundColor Green
-    } else {
-        Write-Host "  [choco] 未检测到 nodejs，跳过" -ForegroundColor Gray
+
+    if (Get-Command scoop -ErrorAction SilentlyContinue) {
+        $scoopList = scoop list 2>$null | Select-String "nodejs"
+        if ($scoopList) {
+            Write-Host "  [scoop] 检测到 Node.js：$scoopList，执行卸载..."
+            scoop uninstall nodejs nodejs-lts 2>$null
+            Write-Host "  [scoop] 卸载完成" -ForegroundColor Green
+            $uninstalledByPkgManager = $true
+        } else {
+            Write-Host "  [scoop] 未检测到 Node.js，跳过" -ForegroundColor Gray
+        }
     }
-}
 
-if (Get-Command scoop -ErrorAction SilentlyContinue) {
-    $scoopList = scoop list 2>$null | Select-String "nodejs"
-    if ($scoopList) {
-        Write-Host "  [scoop] 检测到 Node.js：$scoopList，执行卸载..."
-        scoop uninstall nodejs nodejs-lts 2>$null
-        Write-Host "  [scoop] 卸载完成" -ForegroundColor Green
-    } else {
-        Write-Host "  [scoop] 未检测到 Node.js，跳过" -ForegroundColor Gray
+    # 5-2 WMI 兜底：包管理器都没卸到，且 node 仍存在时才触发
+    if (-not $uninstalledByPkgManager -and (Get-Command node -ErrorAction SilentlyContinue)) {
+        Write-Host "  [WMI] 包管理器未能卸载，尝试 WMI 卸载（可能需要等待30秒）..." -ForegroundColor Yellow
+        $wmiNode = Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -like "*Node.js*" }
+        if ($wmiNode) {
+            foreach ($pkg in $wmiNode) {
+                Write-Host "  [WMI] 发现：$($pkg.Name) $($pkg.Version)，执行卸载..." -ForegroundColor Yellow
+                $pkg.Uninstall() | Out-Null
+                Write-Host "  [WMI] 卸载完成" -ForegroundColor Green
+            }
+        } else {
+            Write-Host "  [WMI] 未找到 MSI 安装的 Node.js，跳过" -ForegroundColor Gray
+        }
     }
-}
 
-# 5-2 注册表定位残留目录
-Write-Host "  [注册表] 查找 Node.js 安装路径..."
-$nodeRegDirs = Get-InstallDirsFromRegistry -RegPaths @(
-    "HKLM:\SOFTWARE\Node.js",
-    "HKLM:\SOFTWARE\WOW6432Node\Node.js",
-    "HKCU:\SOFTWARE\Node.js"
-)
+    # 5-3 注册表定位残留目录
+    Write-Host "  [注册表] 查找 Node.js 安装路径..."
+    $nodeRegDirs = Get-InstallDirsFromRegistry -RegPaths @(
+        "HKLM:\SOFTWARE\Node.js",
+        "HKLM:\SOFTWARE\WOW6432Node\Node.js",
+        "HKCU:\SOFTWARE\Node.js"
+    )
 
-# 5-3 where.exe 定位残留目录（node.exe 就在根目录，Depth=0）
-Write-Host "  [where.exe] 查找 Node.js 残留..."
-$nodeWhereDirs = Get-DirsFromWhere -Command "node" -Depth 0
+    # 5-4 where.exe 定位残留目录（node.exe 就在根目录，Depth=0）
+    Write-Host "  [where.exe] 查找 Node.js 残留..."
+    $nodeWhereDirs = Get-DirsFromWhere -Command "node" -Depth 0
 
-# 5-4 硬编码兜底路径
-$nodeFallbackDirs = @(
-    "C:\Program Files\nodejs",
-    "C:\Program Files (x86)\nodejs"
-)
+    # 5-5 硬编码兜底路径
+    $nodeFallbackDirs = @(
+        "C:\Program Files\nodejs",
+        "C:\Program Files (x86)\nodejs"
+    )
 
-# 5-5 合并所有来源，统一删除
-$allNodeDirs = Merge-Dirs -Sources @($nodeRegDirs, $nodeWhereDirs, $nodeFallbackDirs)
-Remove-DirList -Dirs $allNodeDirs -Label "Node.js"
+    # 5-6 合并所有来源，统一删除
+    $allNodeDirs = Merge-Dirs -Sources @($nodeRegDirs, $nodeWhereDirs, $nodeFallbackDirs)
+    Remove-DirList -Dirs $allNodeDirs -Label "Node.js"
 
-# 5-6 清理 nvm-windows
-Write-Host "  [nvm] 查找 nvm-windows..."
-$nvmDirs = @(
-    "$env:APPDATA\nvm",
-    "$env:LOCALAPPDATA\nvm"
-)
-foreach ($dir in $nvmDirs) {
-    Remove-DirIfExists -Path $dir -Label "nvm-windows ($dir)"
-}
+    # 5-7 清理 nvm-windows
+    Write-Host "  [nvm] 查找 nvm-windows..."
+    $nvmDirs = @(
+        "$env:APPDATA\nvm",
+        "$env:LOCALAPPDATA\nvm"
+    )
+    foreach ($dir in $nvmDirs) {
+        Remove-DirIfExists -Path $dir -Label "nvm-windows ($dir)"
+    }
 
-# 5-7 清理 fnm
-Write-Host "  [fnm] 查找 fnm..."
-$fnmDirs = @(
-    "$env:APPDATA\fnm",
-    "$env:LOCALAPPDATA\fnm"
-)
-foreach ($dir in $fnmDirs) {
-    Remove-DirIfExists -Path $dir -Label "fnm ($dir)"
-}
+    # 5-8 清理 fnm
+    Write-Host "  [fnm] 查找 fnm..."
+    $fnmDirs = @(
+        "$env:APPDATA\fnm",
+        "$env:LOCALAPPDATA\fnm"
+    )
+    foreach ($dir in $fnmDirs) {
+        Remove-DirIfExists -Path $dir -Label "fnm ($dir)"
+    }
+
+} # end if $nodeExists
 
 # ============================================================
 # Step 6：删除 npm / cache 目录

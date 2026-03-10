@@ -1,5 +1,4 @@
 ﻿# OpenClaw速装神器
-# 支持的操作系统：Windows11 / Windows10
 # 作者：再凝秋水
 # 基于OpenClaw官方安装脚本install.ps1开发
 param(
@@ -89,7 +88,7 @@ function Install-Node {
     $ErrorActionPreference = "Continue"
     Write-Host "[*] Installing Node.js..." -ForegroundColor Yellow
 
-    $nodeVersion = "22.14.0"
+    $nodeVersion = "24.14.0"
     $downloadUrl = "https://registry.npmmirror.com/-/binary/node/v$nodeVersion/node-v$nodeVersion-x64.msi"
     $installerPath = "$env:TEMP\node-v$nodeVersion-x64.msi"
 
@@ -569,7 +568,7 @@ function Main {
 	# ssh -> https（避免没有SSH key时被GitHub拒绝）
 	git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
 	# libsignal-node 专项重定向到 Gitee 镜像（）
-	# git config --global url."https://gitee.com/zainingqiushui/libsignal-node.git".insteadOf "https://github.com/whiskeysockets/libsignal-node.git"
+	git config --global url."https://gitee.com/zainingqiushui/libsignal-node.git".insteadOf "https://github.com/whiskeysockets/libsignal-node.git"
 
     Write-Host "[OK] git url rewrite set" -ForegroundColor Green
 
