@@ -39,6 +39,7 @@ Write-Host " %USERPROFILE%\.git-credentials" -ForegroundColor Cyan
 Write-Host " %USERPROFILE%\.openclaw" -ForegroundColor Cyan
 Write-Host " %LOCALAPPDATA%\Temp\openclaw" -ForegroundColor Cyan
 Write-Host "·清理系统及用户 PATH 中与 Node / Git / npm 相关的条目" -ForegroundColor Cyan
+Write-Host "·清理 Git 注册表键" -ForegroundColor Cyan
 Write-Host "·卸载 OpenClaw 网关服务及相关计划任务" -ForegroundColor Cyan
 Write-Host ""
 Write-Host " 如果您在上述目录中存有其他重要资料，建议先手动备份后再继续。" -ForegroundColor DarkCyan
@@ -168,29 +169,15 @@ if (-not $openclawCmd) {
 Write-Host ""
 Write-Host "2. 检查并删除 OpenClaw 计划任务"
 
-$taskOutput = schtasks /query /fo list 2>$null
-$taskNames = @()
-
-$taskOutput -split "`n" | ForEach-Object {
-    if ($_ -match "^任务名称:\s*(.+)" -or $_ -match "^TaskName:\s*(.+)") {
-        $name = $Matches[1].Trim()
-        if ($name -imatch "openclaw") {
-            $taskNames += $name
-        }
-    }
-}
-
-if ($taskNames.Count -eq 0) {
+# 使用 PowerShell 原生 Get-ScheduledTask，避免 schtasks /query 中英文输出格式不一致的问题
+$tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -imatch "openclaw" }
+if (-not $tasks -or $tasks.Count -eq 0) {
     Write-Host "  未发现 OpenClaw 相关计划任务，跳过" -ForegroundColor Gray
 } else {
-    foreach ($name in $taskNames) {
-        Write-Host "  发现计划任务：$name"
-        schtasks /delete /tn "$name" /f
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "  已删除：$name" -ForegroundColor Green
-        } else {
-            Write-Host "  删除失败：$name（可能需要更高权限）" -ForegroundColor Yellow
-        }
+    foreach ($task in $tasks) {
+        Write-Host "  发现计划任务：$($task.TaskName)"
+        Unregister-ScheduledTask -TaskName $task.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+        Write-Host "  已删除：$($task.TaskName)" -ForegroundColor Green
     }
 }
 
@@ -247,7 +234,6 @@ if (-not $nodeProc) {
 Write-Host ""
 Write-Host "5. 卸载 Node.js"
 
-# 先判断 node 是否存在，不存在则跳过整个 Step 5
 $nodeExists = Get-Command node -ErrorAction SilentlyContinue
 if (-not $nodeExists) {
     Write-Host "  未检测到 Node.js，跳过卸载" -ForegroundColor Gray
@@ -338,7 +324,23 @@ if (-not $nodeExists) {
     $allNodeDirs = Merge-Dirs -Sources @($nodeRegDirs, $nodeWhereDirs, $nodeFallbackDirs)
     Remove-DirList -Dirs $allNodeDirs -Label "Node.js"
 
-    # 5-7 清理 nvm-windows
+    # 5-7 清理 Node.js 注册表键（防止下次安装读到旧路径）
+    Write-Host "  [注册表] 清理 Node.js 注册表键..."
+    $nodeRegPaths = @(
+        "HKLM:\SOFTWARE\Node.js",
+        "HKLM:\SOFTWARE\WOW6432Node\Node.js",
+        "HKCU:\SOFTWARE\Node.js"
+    )
+    foreach ($reg in $nodeRegPaths) {
+        if (Test-Path $reg) {
+            Remove-Item $reg -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "  已删除注册表键：$reg" -ForegroundColor Green
+        } else {
+            Write-Host "  注册表键不存在，跳过：$reg" -ForegroundColor Gray
+        }
+    }
+
+    # 5-8 清理 nvm-windows
     Write-Host "  [nvm] 查找 nvm-windows..."
     $nvmDirs = @(
         "$env:APPDATA\nvm",
@@ -348,7 +350,7 @@ if (-not $nodeExists) {
         Remove-DirIfExists -Path $dir -Label "nvm-windows ($dir)"
     }
 
-    # 5-8 清理 fnm
+    # 5-9 清理 fnm
     Write-Host "  [fnm] 查找 fnm..."
     $fnmDirs = @(
         "$env:APPDATA\fnm",
@@ -412,53 +414,71 @@ if (-not $pkgFound) {
 
 # ============================================================
 # Step 8：卸载 Git
-# 顺序：包管理器正式卸载 → 注册表定位 → where.exe 定位 → 硬编码兜底
+# 顺序：kill GPG 守护进程（始终） → 包管理器正式卸载 → 注册表定位目录（始终）
+#        → where.exe 定位（始终） → 硬编码兜底（始终） → 删目录（始终） → 清注册表键（始终）
+# 注意：kill GPG、删目录、清注册表键 三步始终执行，不受 $gitExists 影响
+#        原因：git 命令找不到，不代表守护进程、残留目录、注册表键不存在
+#              尤其是上一次 reset 因守护进程占用导致目录未删干净的情况
 # ============================================================
 
 Write-Host ""
 Write-Host "8. 卸载 Git"
 
-# 8-1 包管理器正式卸载
-if (Get-Command winget -ErrorAction SilentlyContinue) {
-    $wingetList = winget list 2>$null
-    if ($wingetList -match "Git\.Git") {
-        Write-Host "  [winget] 检测到 Git，执行卸载..."
-        winget uninstall --id Git.Git --silent --accept-source-agreements 2>$null
-        Write-Host "  [winget] 卸载完成" -ForegroundColor Green
-    } else {
-        Write-Host "  [winget] 未检测到 Git，跳过" -ForegroundColor Gray
+# 8-0 始终执行：结束 GPG 守护进程，防止占用文件导致目录删除失败
+# 即使 git 命令已不存在，守护进程可能仍在后台运行
+foreach ($proc in @("keyboxd", "gpg-agent", "dirmngr", "scdaemon")) {
+    $p = Get-Process $proc -ErrorAction SilentlyContinue
+    if ($p) {
+        $p | Stop-Process -Force
+        Write-Host "  已结束进程：$proc" -ForegroundColor Green
     }
 }
 
-if (Get-Command choco -ErrorAction SilentlyContinue) {
-	$chocoGit = choco list 2>$null | Select-String "^git"
-	if ($chocoGit) {
-		Write-Host "  [choco] 检测到 Git：$chocoGit，执行卸载..."
-		# 分别检测再分别卸载，不多卸不存在的包
-		if (choco list 2>$null | Select-String "^git\.install") {
-			choco uninstall git.install -y --force
-		}
-		if (choco list 2>$null | Select-String "^git ") {
-			choco uninstall git -y --force
-		}
-		Write-Host "  [choco] 卸载完成" -ForegroundColor Green
-	} else {
-        Write-Host "  [choco] 未检测到 Git，跳过" -ForegroundColor Gray
+# 8-1 包管理器正式卸载（仅 git 命令存在时才有意义）
+$gitExists = Get-Command git -ErrorAction SilentlyContinue
+if (-not $gitExists) {
+    Write-Host "  未检测到 git 命令，跳过包管理器卸载步骤" -ForegroundColor Gray
+} else {
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        $wingetList = winget list 2>$null
+        if ($wingetList -match "Git\.Git") {
+            Write-Host "  [winget] 检测到 Git，执行卸载..."
+            winget uninstall --id Git.Git --silent --accept-source-agreements 2>$null
+            Write-Host "  [winget] 卸载完成" -ForegroundColor Green
+        } else {
+            Write-Host "  [winget] 未检测到 Git，跳过" -ForegroundColor Gray
+        }
     }
-}
 
-if (Get-Command scoop -ErrorAction SilentlyContinue) {
-    $scoopList = scoop list 2>$null | Select-String "^git "
-    if ($scoopList) {
-        Write-Host "  [scoop] 检测到 Git：$scoopList，执行卸载..."
-        scoop uninstall git 2>$null
-        Write-Host "  [scoop] 卸载完成" -ForegroundColor Green
-    } else {
-        Write-Host "  [scoop] 未检测到 Git，跳过" -ForegroundColor Gray
+    if (Get-Command choco -ErrorAction SilentlyContinue) {
+        $chocoGit = choco list 2>$null | Select-String "^git"
+        if ($chocoGit) {
+            Write-Host "  [choco] 检测到 Git：$chocoGit，执行卸载..."
+            if (choco list 2>$null | Select-String "^git\.install") {
+                choco uninstall git.install -y --force
+            }
+            if (choco list 2>$null | Select-String "^git ") {
+                choco uninstall git -y --force
+            }
+            Write-Host "  [choco] 卸载完成" -ForegroundColor Green
+        } else {
+            Write-Host "  [choco] 未检测到 Git，跳过" -ForegroundColor Gray
+        }
     }
-}
 
-# 8-2 注册表定位残留目录
+    if (Get-Command scoop -ErrorAction SilentlyContinue) {
+        $scoopList = scoop list 2>$null | Select-String "^git "
+        if ($scoopList) {
+            Write-Host "  [scoop] 检测到 Git：$scoopList，执行卸载..."
+            scoop uninstall git 2>$null
+            Write-Host "  [scoop] 卸载完成" -ForegroundColor Green
+        } else {
+            Write-Host "  [scoop] 未检测到 Git，跳过" -ForegroundColor Gray
+        }
+    }
+} # end if $gitExists
+
+# 8-2 始终执行：注册表定位残留目录
 Write-Host "  [注册表] 查找 Git 安装路径..."
 $gitRegDirs = Get-InstallDirsFromRegistry -RegPaths @(
     "HKLM:\SOFTWARE\GitForWindows",
@@ -466,20 +486,36 @@ $gitRegDirs = Get-InstallDirsFromRegistry -RegPaths @(
     "HKCU:\SOFTWARE\GitForWindows"
 )
 
-# 8-3 where.exe 定位残留目录
+# 8-3 始终执行：where.exe 定位残留目录
 # git.exe 在 Git\cmd\ 或 Git\bin\ 下，向上一层才是根目录，Depth=1
 Write-Host "  [where.exe] 查找 Git 残留..."
 $gitWhereDirs = Get-DirsFromWhere -Command "git" -Depth 1
 
-# 8-4 硬编码兜底路径
+# 8-4 始终执行：硬编码兜底路径
 $gitFallbackDirs = @(
     "C:\Program Files\Git",
     "C:\Program Files (x86)\Git"
 )
 
-# 8-5 合并所有来源，统一删除
+# 8-5 始终执行：合并所有来源，统一删除目录
 $allGitDirs = Merge-Dirs -Sources @($gitRegDirs, $gitWhereDirs, $gitFallbackDirs)
 Remove-DirList -Dirs $allGitDirs -Label "Git"
+
+# 8-6 始终执行：清理 Git 注册表键（目录删完后再删键，防止下次安装读到旧路径）
+Write-Host "  [注册表] 清理 Git 注册表键..."
+$gitRegPaths = @(
+    "HKLM:\SOFTWARE\GitForWindows",
+    "HKLM:\SOFTWARE\WOW6432Node\GitForWindows",
+    "HKCU:\SOFTWARE\GitForWindows"
+)
+foreach ($reg in $gitRegPaths) {
+    if (Test-Path $reg) {
+        Remove-Item $reg -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host "  已删除注册表键：$reg" -ForegroundColor Green
+    } else {
+        Write-Host "  注册表键不存在，跳过：$reg" -ForegroundColor Gray
+    }
+}
 
 # ============================================================
 # Step 8.5：清理 Chocolatey 缓存
@@ -636,4 +672,5 @@ if ($allClean) {
     Write-Host "==== 清理完成，但有部分警告，请检查上方输出 ====" -ForegroundColor Yellow
 }
 
+Write-Host ""
 Write-Host "如果要确认是否清除干净，或安装OpenClaw，请先关闭此窗口，再用管理员身份重新打开 PowerShell" -ForegroundColor Cyan

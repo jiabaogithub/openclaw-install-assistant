@@ -67,7 +67,8 @@ function Check-Node {
     try {
         $nodeVersion = (node -v 2>$null)
         if ($nodeVersion) {
-            $version = [int]($nodeVersion-replace'v(\d+)\..*', '$1')
+            # 使用 [regex]::Match 正确提取版本号，避免 -replace 无法提取捕获组的 bug
+            $version = [int]([regex]::Match($nodeVersion,'v(\d+)\.').Groups[1].Value)
             if ($version -ge 22) {
                 Write-Host "[OK] Node.js $nodeVersion found" -ForegroundColor Green
                 return $true
@@ -114,14 +115,14 @@ function Install-Node {
     }
 
     Write-Host "  文件大小：$([math]::Round((Get-Item $installerPath).Length / 1MB, 1)) MB" -ForegroundColor Gray
-    # 正确写法：通过 msiexec 调用，并加 ADDLOCAL=ALL 确保写入 PATH
+
     Write-Host "  安装中..." -ForegroundColor Gray
     $result = Start-Process -FilePath "msiexec.exe" `
-    -Args "/i `"$installerPath`" /quiet /norestart ADDLOCAL=ALL" `
-    -Wait -PassThru
+        -Args "/i `"$installerPath`" /quiet /norestart ADDLOCAL=ALL" `
+        -Wait -PassThru
     Write-Host "  安装程序退出码：$($result.ExitCode)" -ForegroundColor Gray
 
-    # 用管理员权限持久写入系统 Path（而不只是改当前进程）
+    # 用管理员权限持久写入系统 Path
     $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
     $nodePath = "C:\Program Files\nodejs"
 
@@ -135,8 +136,8 @@ function Install-Node {
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" +
                 [System.Environment]::GetEnvironmentVariable("Path","User")
 
-        Write-Host "[OK] Node.js $nodeVersion installed" -ForegroundColor Green
-    }
+    Write-Host "[OK] Node.js $nodeVersion installed" -ForegroundColor Green
+}
 
 # Check for Git
 function Check-Git {
@@ -152,6 +153,16 @@ function Check-Git {
 function Install-Git {
     $ErrorActionPreference = "Continue"
     Write-Host "[*] Installing Git..." -ForegroundColor Yellow
+
+    # 安装前先结束 GPG 守护进程，防止残留进程占用旧 Git 目录导致删除失败
+    Write-Host "  清理 GPG 守护进程..." -ForegroundColor Gray
+    foreach ($proc in @("keyboxd", "gpg-agent", "dirmngr", "scdaemon")) {
+        $p = Get-Process $proc -ErrorAction SilentlyContinue
+        if ($p) {
+            $p | Stop-Process -Force
+            Write-Host "  已结束进程：$proc" -ForegroundColor Gray
+        }
+    }
 
     $downloadUrl = "https://registry.npmmirror.com/-/binary/git-for-windows/v2.53.0.windows.1/Git-2.53.0-64-bit.exe"
     $installerPath = "$env:TEMP\Git-2.53.0-64-bit.exe"
@@ -178,20 +189,47 @@ function Install-Git {
     }
 
     Write-Host "  文件大小：$([math]::Round((Get-Item $installerPath).Length / 1MB, 1)) MB" -ForegroundColor Gray
-    Write-Host "  安装中..." -ForegroundColor Gray
 
-    $result = Start-Process -FilePath $installerPath -Args "/VERYSILENT /NORESTART /SUPPRESSMSGBOXES" -Wait -PassThru
+    Write-Host "  安装中..." -ForegroundColor Gray
+    # 用 /DIR= 强制锁定安装目录，彻底避免注册表残留导致装到旧路径
+    $gitInstallPath = "C:\Program Files\Git"
+    $result = Start-Process -FilePath $installerPath `
+        -ArgumentList "/VERYSILENT /NORESTART /SUPPRESSMSGBOXES /DIR=`"$gitInstallPath`"" `
+        -Wait -PassThru
     Write-Host "  安装程序退出码：$($result.ExitCode)" -ForegroundColor Gray
 
-    # 主动检查并写入系统 Path
-    $gitPath = "C:\Program Files\Git\cmd"
-    if (Test-Path $gitPath) {
-        $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
-        if (-not ($machinePath -split ";" | Where-Object { $_ -ieq $gitPath })) {
-            $newMachinePath = $machinePath.TrimEnd(";") + ";$gitPath"
-            [Environment]::SetEnvironmentVariable("Path", $newMachinePath, "Machine")
-            Write-Host "  已将 $gitPath 永久写入系统 Path" -ForegroundColor Gray
+    if ($result.ExitCode -ne 0) {
+        Write-Host "  Git 安装失败，退出码：$($result.ExitCode)" -ForegroundColor Red
+        exit 1
+    }
+
+    # 注册表读取仅用于验证，不影响主流程
+    $gitRegPaths = @(
+        "HKLM:\SOFTWARE\GitForWindows",
+        "HKLM:\SOFTWARE\WOW6432Node\GitForWindows",
+        "HKCU:\SOFTWARE\GitForWindows"
+    )
+    foreach ($reg in $gitRegPaths) {
+        if (Test-Path $reg) {
+            $val = (Get-ItemProperty $reg -ErrorAction SilentlyContinue).InstallPath
+            if ($val -and $val.TrimEnd('\') -ine $gitInstallPath) {
+                Write-Host "  注意：注册表路径 ($val) 与安装路径不一致，以安装路径为准" -ForegroundColor Yellow
+            }
+            break
         }
+    }
+
+    # PATH 写入直接使用 /DIR= 指定的路径，与安装目录始终一致
+    $gitCmdPath = Join-Path $gitInstallPath "cmd"
+    if (Test-Path $gitCmdPath) {
+        $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+        if (-not ($machinePath -split ";" | Where-Object { $_ -ieq $gitCmdPath })) {
+            $newMachinePath = $machinePath.TrimEnd(";") + ";$gitCmdPath"
+            [Environment]::SetEnvironmentVariable("Path", $newMachinePath, "Machine")
+            Write-Host "  已将 $gitCmdPath 永久写入系统 Path" -ForegroundColor Gray
+        }
+    } else {
+        Write-Host "  警告：$gitCmdPath 不存在，PATH 未更新" -ForegroundColor Yellow
     }
 
     # 刷新当前进程 Path
@@ -345,11 +383,11 @@ function Install-OpenClaw {
     }
     Write-Host "[*] Installing OpenClaw ($packageName@$Tag)..." -ForegroundColor Yellow
 
-    $prevLogLevel        = $env:NPM_CONFIG_LOGLEVEL
-    $prevUpdateNotifier  = $env:NPM_CONFIG_UPDATE_NOTIFIER
-    $prevFund            = $env:NPM_CONFIG_FUND
-    $prevAudit           = $env:NPM_CONFIG_AUDIT
-    $prevScriptShell     = $env:NPM_CONFIG_SCRIPT_SHELL
+    $prevLogLevel       = $env:NPM_CONFIG_LOGLEVEL
+    $prevUpdateNotifier = $env:NPM_CONFIG_UPDATE_NOTIFIER
+    $prevFund           = $env:NPM_CONFIG_FUND
+    $prevAudit          = $env:NPM_CONFIG_AUDIT
+    $prevScriptShell    = $env:NPM_CONFIG_SCRIPT_SHELL
 
     $env:NPM_CONFIG_UPDATE_NOTIFIER = "false"
     $env:NPM_CONFIG_FUND            = "false"
@@ -530,8 +568,6 @@ function Main {
         return
     }
 
-    Remove-LegacySubmodule -RepoDir $GitDir
-
     # Check for existing installation
     $isUpgrade = Check-ExistingOpenClaw
 
@@ -565,11 +601,10 @@ function Main {
 
     # Step 3: git url rewrite
     Write-Host "[*] Setting git url rewrite: ssh://git@github.com/ -> https://github.com/..." -ForegroundColor Yellow
-	# ssh -> https（避免没有SSH key时被GitHub拒绝）
-	git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
-	# libsignal-node 专项重定向到 Gitee 镜像（）
-	git config --global url."https://gitee.com/zainingqiushui/libsignal-node.git".insteadOf "https://github.com/whiskeysockets/libsignal-node.git"
-
+    # ssh -> https（避免没有SSH key时被GitHub拒绝）
+    git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+    # libsignal-node 专项重定向到 Gitee 镜像
+    git config --global url."https://gitee.com/zainingqiushui/libsignal-node.git".insteadOf "https://github.com/whiskeysockets/libsignal-node.git"
     Write-Host "[OK] git url rewrite set" -ForegroundColor Green
 
     # Step 4: npm 镜像
@@ -582,6 +617,8 @@ function Main {
     # Step 5: OpenClaw
     if ($InstallMethod -eq "git") {
         $finalGitDir = $GitDir
+        # 挪到 Git 安装之后再调用，避免 Git 未就绪时出现问题
+        Remove-LegacySubmodule -RepoDir $GitDir
         Install-OpenClawFromGit -RepoDir $GitDir -SkipUpdate:$NoGitUpdate
     } else {
         Install-OpenClaw
