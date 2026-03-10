@@ -1,4 +1,4 @@
-﻿# OpenClaw速装神器
+﻿# OpenClaw速装工具
 # 作者：再凝秋水
 # 基于OpenClaw官方安装脚本install.ps1开发
 param(
@@ -15,7 +15,7 @@ $ErrorActionPreference = "Stop"
 
 Write-Host ""
 Write-Host "--------------------------------"
-Write-Host "OpenClaw速装神器"
+Write-Host "OpenClaw速装工具"
 Write-Host ""
 Write-Host "作者：再凝秋水"
 Write-Host ""
