@@ -26,3 +26,5 @@
 于是我又花了2个小时，写了这个程序，再安装OpenClaw只要5分钟。  
 
 ###### 作者：再凝秋水  
+###### 小红书视频教程：https://www.xiaohongshu.com/user/profile/60cd6cfb000000000100440c  
+###### B站视频教程：https://space.bilibili.com/409645337
